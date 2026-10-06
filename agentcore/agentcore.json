@@ -16,9 +16,61 @@
       "runtimeVersion": "PYTHON_3_14",
       "networkMode": "PUBLIC",
       "protocol": "A2A"
+    },
+    {
+      "name": "WeatherAgent",
+      "build": "CodeZip",
+      "entrypoint": "main.py",
+      "codeLocation": "app/WeatherAgent/",
+      "runtimeVersion": "PYTHON_3_14",
+      "networkMode": "PUBLIC",
+      "protocol": "A2A"
+    },
+    {
+      "name": "OrchestratorAgent",
+      "build": "CodeZip",
+      "entrypoint": "main.py",
+      "codeLocation": "app/OrchestratorAgent/",
+      "runtimeVersion": "PYTHON_3_14",
+      "networkMode": "PUBLIC",
+      "protocol": "HTTP",
+      "requestHeaderAllowlist": [
+        "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Actor-Id"
+      ],
+      "envVars": [
+        {
+          "name": "TRIP_MEMORY_ID",
+          "value": "tripplaner_TripPlannerMemory-Z0ubr16QhZ"
+        }
+      ]
     }
   ],
-  "memories": [],
+  "memories": [
+    {
+      "name": "TripPlannerMemory",
+      "eventExpiryDuration": 90,
+      "strategies": [
+        {
+          "type": "USER_PREFERENCE",
+          "name": "TravelerPreferences",
+          "description": "Preferencias de viaje del usuario (horarios, aerolíneas, asientos).",
+          "namespaceTemplates": ["/preferences/{actorId}/"]
+        },
+        {
+          "type": "SUMMARIZATION",
+          "name": "SessionSummarizer",
+          "description": "Resumen por sesión de planificación de viaje.",
+          "namespaceTemplates": ["/summaries/{actorId}/{sessionId}/"]
+        },
+        {
+          "type": "SEMANTIC",
+          "name": "TravelFacts",
+          "description": "Hechos relevantes del viaje recuperables por significado.",
+          "namespaceTemplates": ["/facts/{actorId}/"]
+        }
+      ]
+    }
+  ],
   "knowledgeBases": [],
   "credentials": [],
   "evaluators": [],
