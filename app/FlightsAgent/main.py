@@ -1,63 +1,111 @@
 # app/FlightsAgent/main.py
 import os
+from datetime import date
+from uuid import uuid4
 from urllib.parse import quote
 
+from mcp.client.streamable_http import streamable_http_client
 from strands import Agent, tool
 from strands.models import BedrockModel
 from strands.multiagent.a2a import A2AServer
+from strands.tools.mcp import MCPClient
 
+from flight_results import format_flight_results
+from flight_response import FlightResponseAgent
 
-AIRLINE_BY_CODE_PREFIX = {
-    "AV": "Avianca",
-    "LA": "LATAM",
+TRAVEL_MCP_URL = os.environ.get("TRAVEL_MCP_URL", "https://mcp.skiplagged.com/mcp")
+
+# Solo exponemos al LLM las tools de vuelos (el servidor trae 9, incluidas hoteles y carros).
+ALLOWED_TOOLS = {"sk_flights_search", "sk_resolve_iata"}
+
+# Sesión abierta durante toda la vida del proceso (servidor A2A de larga vida):
+# por eso start() y no "with".
+travel_mcp = MCPClient(lambda: streamable_http_client(TRAVEL_MCP_URL))
+travel_mcp.start()
+available_tools = {
+    tool.tool_name: tool
+    for tool in travel_mcp.list_tools_sync()
+    if tool.tool_name in ALLOWED_TOOLS
 }
+missing_tools = ALLOWED_TOOLS - available_tools.keys()
+if missing_tools:
+    raise RuntimeError(
+        f"El servidor MCP en {TRAVEL_MCP_URL} no expone las tools esperadas: "
+        f"{', '.join(sorted(missing_tools))}"
+    )
 
 
-def airline_name(flight_code: str) -> str:
-    """Return the carrier for a simulated flight code, failing on unknown prefixes."""
-    prefix = flight_code[:2].upper()
-    try:
-        return AIRLINE_BY_CODE_PREFIX[prefix]
-    except KeyError as exc:
-        raise ValueError(f"Unknown airline code prefix: {prefix}") from exc
-
-
-@tool
-def search_flights(origin: str, destination: str, date: str) -> list[dict]:
-    """Busca vuelos entre dos ciudades para una fecha (datos simulados)."""
-    options = [
-        {"flight": "AV9821", "depart": "07:15", "price_usd": 89},
-        {"flight": "LA4410", "depart": "12:40", "price_usd": 76},
-        {"flight": "AV9835", "depart": "18:05", "price_usd": 102},
-    ]
-    return [
-        {
-            "origin": origin,
-            "destination": destination,
-            "date": date,
-            **o,
-            "airline": airline_name(o["flight"]),
-        }
-        for o in options
-    ]
+def build_system_prompt() -> str:
+    return (
+        f"Hoy es {date.today().isoformat()}. "
+        "Eres un agente de vuelos. Para buscar usa sk_flights_search con: "
+        "origin y destination como códigos IATA (si el usuario da una ciudad y no sabes "
+        "el código, usa sk_resolve_iata primero), departureDate en formato YYYY-MM-DD "
+        "(si el usuario no da el año, usa la próxima fecha futura), sort='price', limit=5, "
+        "includeHiddenCity=false e includeVirtualInterlining=false. "
+        "La herramienta devuelve el resultado final ya ordenado, con la fecha y el vuelo más "
+        "barato marcados. Copia su respuesta exactamente, conservando cada salto de línea, "
+        "sin volver a ordenar, recalcular, agregar moneda ni cambiar vuelos, aerolíneas o precios. "
+        "No incluyas razonamiento ni etiquetas como <thinking>. "
+        "Si la herramienta falla o no hay resultados, dilo en una sola línea. "
+        "No agregues más texto."
+    )
 
 
 def create_agent(context_id: str) -> Agent:
-    return Agent(
+    search_state: dict[str, str | None] = {"response": None}
+
+    @tool
+    def sk_flights_search(
+        origin: str,
+        destination: str,
+        departureDate: str,
+        sort: str = "price",
+        limit: int = 5,
+        includeHiddenCity: bool = False,
+        includeVirtualInterlining: bool = False,
+    ) -> str:
+        """Busca vuelos y devuelve resultados ordenados con el precio mínimo marcado."""
+        result = travel_mcp.call_tool_sync(
+            uuid4().hex,
+            "sk_flights_search",
+            {
+                "origin": origin,
+                "destination": destination,
+                "departureDate": departureDate,
+                "sort": sort,
+                "limit": limit,
+                "includeHiddenCity": includeHiddenCity,
+                "includeVirtualInterlining": includeVirtualInterlining,
+            },
+        )
+        if result["status"] != "success":
+            raise RuntimeError(f"La herramienta sk_flights_search falló: {result['status']}")
+
+        text_blocks = [
+            block["text"]
+            for block in result["content"]
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
+        if not text_blocks:
+            raise RuntimeError("La herramienta sk_flights_search no devolvió contenido de texto")
+        response = format_flight_results(
+            "\n".join(text_blocks),
+            origin,
+            destination,
+            departureDate,
+        )
+        search_state["response"] = response
+        return response
+
+    return FlightResponseAgent(
         name="Flights Agent",
         description="Busca vuelos entre ciudades para una fecha dada.",
         model=BedrockModel(model_id="us.amazon.nova-lite-v1:0", region_name="us-east-2"),
-        system_prompt=(
-            "Eres un agente de vuelos. Usa search_flights con origen, destino y fecha. "
-            "Responde solo con una línea por vuelo, ordenadas por hora de salida, con el formato "
-            "'<vuelo> | <aerolínea> | salida <hora> | <precio> USD'. Usa exactamente el campo "
-            "'airline' devuelto por search_flights; no deduzcas ni inventes aerolíneas a partir "
-            "del código. Agrega ' (más barato)' al final de la línea del vuelo de menor precio y "
-            "solo de esa. Antes de las líneas escribe una sola línea con la ruta y la fecha "
-            "consultadas en formato DD/MM/AAAA. No agregues más texto."
-        ),
-        tools=[search_flights],
+        system_prompt=build_system_prompt(),
+        tools=[available_tools["sk_resolve_iata"], sk_flights_search],
         callback_handler=None,
+        search_state=search_state,
     )
 
 

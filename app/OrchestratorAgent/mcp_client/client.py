@@ -1,6 +1,6 @@
 import os
 import logging
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 from strands.tools.mcp.mcp_client import MCPClient
 
 logger = logging.getLogger(__name__)
@@ -11,4 +11,4 @@ EXAMPLE_MCP_ENDPOINT = "https://mcp.exa.ai/mcp"
 def get_streamable_http_mcp_client() -> MCPClient:
     """Returns an MCP Client compatible with Strands"""
     # to use an MCP server that supports bearer authentication, add headers={"Authorization": f"Bearer {access_token}"}
-    return MCPClient(lambda: streamablehttp_client(EXAMPLE_MCP_ENDPOINT))
+    return MCPClient(lambda: streamable_http_client(EXAMPLE_MCP_ENDPOINT))

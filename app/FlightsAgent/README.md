@@ -15,6 +15,16 @@ uv run python main.py
 
 The agent starts on port 9000.
 
+The agent searches flights through the Skiplagged MCP server. Its Markdown results are parsed
+locally to sort offers by departure time and mark the lowest returned price. Set `TRAVEL_MCP_URL`
+to override the MCP endpoint.
+
+Run the flights unit tests from the repository root with:
+
+```bash
+python -m unittest tests.test_flights_agent -v
+```
+
 ## Deploy
 
 ```bash

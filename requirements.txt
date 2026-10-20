@@ -1,0 +1,8 @@
+a2a-sdk[all]==0.3.26
+aws-opentelemetry-distro==0.18.0
+bedrock-agentcore[a2a,strands-agents]==1.24.0
+boto3==1.43.108
+botocore[crt]==1.43.108
+httpx==0.28.1
+mcp==1.30.0
+strands-agents[a2a]==1.57.2

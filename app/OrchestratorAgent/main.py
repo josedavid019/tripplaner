@@ -77,12 +77,8 @@ class SigV4HttpxAuth(httpx.Auth):
         yield request
 
 
-def make_remote_agent(arn: str) -> A2AAgent:
-    """Crea un cliente A2A autenticado hacia un especialista."""
-    http_client = httpx.AsyncClient(
-        auth=SigV4HttpxAuth(REGION),
-        timeout=httpx.Timeout(60.0),
-    )
+def make_remote_agent(arn: str, http_client: httpx.AsyncClient) -> A2AAgent:
+    """Crea un cliente A2A autenticado usando el HTTP client de la llamada actual."""
     config = ClientConfig(httpx_client=http_client, streaming=False)
     endpoint = runtime_url(arn)
     try:
@@ -92,18 +88,25 @@ def make_remote_agent(arn: str) -> A2AAgent:
         return A2AAgent(endpoint=endpoint, a2a_client_factory=ClientFactory(config))
 
 
+async def _invoke_remote_agent(arn: str, request: str) -> str:
+    async with httpx.AsyncClient(
+        auth=SigV4HttpxAuth(REGION),
+        timeout=httpx.Timeout(60.0),
+    ) as http_client:
+        remote = make_remote_agent(arn, http_client)
+        return str(await remote.invoke_async(request))
+
+
 @tool
-def ask_flights(request: str) -> str:
+async def ask_flights(request: str) -> str:
     """Delega en el Flights Agent la búsqueda de vuelos."""
-    remote = make_remote_agent(FLIGHTS_ARN)
-    return str(remote(request))
+    return await _invoke_remote_agent(FLIGHTS_ARN, request)
 
 
 @tool
-def ask_weather(request: str) -> str:
+async def ask_weather(request: str) -> str:
     """Delega en el Weather Agent la consulta de clima."""
-    remote = make_remote_agent(WEATHER_ARN)
-    return str(remote(request))
+    return await _invoke_remote_agent(WEATHER_ARN, request)
 
 
 DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
@@ -157,9 +160,10 @@ def build_system_prompt() -> str:
         "ambos (suma exacta de los dos precios) y cómo estará el clima. Segunda: si hay preferencias "
         "guardadas del usuario (aerolínea u horario), recomienda un vuelo que cumpla todas las "
         "preferencias posibles y menciona por qué. Compara la preferencia de aerolínea con el campo "
-        "explícito <aerolínea> y la de horario con la hora de salida. En estos datos, AV9821 es "
-        "Avianca y sale a las 07:15; por tanto satisface tanto Avianca como salir por la mañana. "
-        "Nunca digas que un vuelo no cumple una preferencia si sus datos explícitos sí la cumplen. "
+        "explícito de aerolínea devuelto por la herramienta y la de horario con la hora de salida. "
+        "Usa los datos de los vuelos de esta búsqueda; no asumas códigos ni aerolíneas de ejemplos "
+        "o búsquedas anteriores. Nunca digas que un vuelo no cumple una preferencia si sus datos "
+        "explícitos sí la cumplen. "
         "Si ningún vuelo cumple todas, recomienda el que cumpla más y explica con precisión el "
         "conflicto. Si no hay preferencias guardadas, omite esta segunda frase.\n\n"
         "REGLAS: usa únicamente datos devueltos por las herramientas; no inventes vuelos, "
