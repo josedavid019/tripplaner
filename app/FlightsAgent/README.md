@@ -17,7 +17,9 @@ The agent starts on port 9000.
 
 The agent searches flights through the Skiplagged MCP server. Its Markdown results are parsed
 locally to sort offers by departure time and mark the lowest returned price. Set `TRAVEL_MCP_URL`
-to override the MCP endpoint.
+to override the MCP endpoint. Searches have a 25-second MCP read timeout; on timeout, server
+failure, or an unrecognized response format, the agent returns a fixed unavailable message rather
+than generating flight details.
 
 Run the flights unit tests from the repository root with:
 

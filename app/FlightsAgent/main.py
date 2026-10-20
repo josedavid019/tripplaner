@@ -1,6 +1,7 @@
 # app/FlightsAgent/main.py
+import logging
 import os
-from datetime import date
+from datetime import date, timedelta
 from uuid import uuid4
 from urllib.parse import quote
 
@@ -10,10 +11,12 @@ from strands.models import BedrockModel
 from strands.multiagent.a2a import A2AServer
 from strands.tools.mcp import MCPClient
 
-from flight_results import format_flight_results
+from flight_results import flight_search_unavailable_message, format_flight_results
 from flight_response import FlightResponseAgent
 
+logger = logging.getLogger(__name__)
 TRAVEL_MCP_URL = os.environ.get("TRAVEL_MCP_URL", "https://mcp.skiplagged.com/mcp")
+MCP_READ_TIMEOUT = timedelta(seconds=25)
 
 # Solo exponemos al LLM las tools de vuelos (el servidor trae 9, incluidas hoteles y carros).
 ALLOWED_TOOLS = {"sk_flights_search", "sk_resolve_iata"}
@@ -66,35 +69,40 @@ def create_agent(context_id: str) -> Agent:
         includeVirtualInterlining: bool = False,
     ) -> str:
         """Busca vuelos y devuelve resultados ordenados con el precio mínimo marcado."""
-        result = travel_mcp.call_tool_sync(
-            uuid4().hex,
-            "sk_flights_search",
-            {
-                "origin": origin,
-                "destination": destination,
-                "departureDate": departureDate,
-                "sort": sort,
-                "limit": limit,
-                "includeHiddenCity": includeHiddenCity,
-                "includeVirtualInterlining": includeVirtualInterlining,
-            },
-        )
-        if result["status"] != "success":
-            raise RuntimeError(f"La herramienta sk_flights_search falló: {result['status']}")
+        try:
+            result = travel_mcp.call_tool_sync(
+                uuid4().hex,
+                "sk_flights_search",
+                {
+                    "origin": origin,
+                    "destination": destination,
+                    "departureDate": departureDate,
+                    "sort": sort,
+                    "limit": limit,
+                    "includeHiddenCity": includeHiddenCity,
+                    "includeVirtualInterlining": includeVirtualInterlining,
+                },
+                read_timeout_seconds=MCP_READ_TIMEOUT,
+            )
+            if result["status"] != "success":
+                raise RuntimeError(f"La herramienta sk_flights_search falló: {result['status']}")
 
-        text_blocks = [
-            block["text"]
-            for block in result["content"]
-            if isinstance(block, dict) and isinstance(block.get("text"), str)
-        ]
-        if not text_blocks:
-            raise RuntimeError("La herramienta sk_flights_search no devolvió contenido de texto")
-        response = format_flight_results(
-            "\n".join(text_blocks),
-            origin,
-            destination,
-            departureDate,
-        )
+            text_blocks = [
+                block["text"]
+                for block in result["content"]
+                if isinstance(block, dict) and isinstance(block.get("text"), str)
+            ]
+            if not text_blocks:
+                raise RuntimeError("La herramienta sk_flights_search no devolvió contenido de texto")
+            response = format_flight_results(
+                "\n".join(text_blocks),
+                origin,
+                destination,
+                departureDate,
+            )
+        except Exception:
+            logger.exception("sk_flights_search falló")
+            response = flight_search_unavailable_message(origin, destination, departureDate)
         search_state["response"] = response
         return response
 

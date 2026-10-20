@@ -1,7 +1,10 @@
 import unittest
 
 from app.FlightsAgent.fallback import airline_name, search_flights
-from app.FlightsAgent.flight_results import format_flight_results
+from app.FlightsAgent.flight_results import (
+    flight_search_unavailable_message,
+    format_flight_results,
+)
 
 
 class FlightAirlineTests(unittest.TestCase):
@@ -95,6 +98,19 @@ class FlightResultFormattingTests(unittest.TestCase):
         self.assertIn(
             "AV1234 / IB5678 | Airline A | Airline B | salida 08:45 | $720 (más barato)",
             format_flight_results(markdown, "BAQ", "MAD", "2026-11-20"),
+        )
+
+    def test_unavailable_message_is_fixed_and_includes_route_and_date(self):
+        self.assertEqual(
+            flight_search_unavailable_message("BAQ", "MAD", "2026-11-20"),
+            "No se pudo consultar vuelos para BAQ a MAD el 20/11/2026 en este momento. "
+            "Intenta de nuevo en unos minutos.",
+        )
+
+    def test_unavailable_message_tolerates_an_invalid_date(self):
+        self.assertIn(
+            "el mañana",
+            flight_search_unavailable_message("BAQ", "MAD", "mañana"),
         )
 
 

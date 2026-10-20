@@ -1,5 +1,6 @@
 import os
 import re
+import unicodedata
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -97,10 +98,39 @@ async def _invoke_remote_agent(arn: str, request: str) -> str:
         return str(await remote.invoke_async(request))
 
 
+def _is_standalone_flight_search(prompt: Any) -> bool:
+    if not isinstance(prompt, str):
+        return False
+
+    normalized = unicodedata.normalize("NFKD", prompt.casefold())
+    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    if not re.search(r"\bvuelos?\s+de\s+.+?\s+a\s+.+", normalized):
+        return False
+
+    planning_terms = ("plan de viaje", "itinerario", "fin de semana", "clima", "tiempo")
+    return not any(term in normalized for term in planning_terms)
+
+
+async def _stream_text_response(text: str):
+    yield {
+        "event": {
+            "contentBlockDelta": {
+                "delta": {"text": text},
+                "contentBlockIndex": 0,
+            }
+        }
+    }
+    yield {"event": {"contentBlockStop": {"contentBlockIndex": 0}}}
+
+
 @tool
 async def ask_flights(request: str) -> str:
     """Delega en el Flights Agent la búsqueda de vuelos."""
-    return await _invoke_remote_agent(FLIGHTS_ARN, request)
+    try:
+        return await _invoke_remote_agent(FLIGHTS_ARN, request)
+    except Exception as exc:
+        log.error(f"ask_flights falló: {exc!r}")
+        return "No se pudo consultar vuelos en este momento. Intenta de nuevo en unos minutos."
 
 
 @tool
@@ -127,37 +157,54 @@ def build_system_prompt() -> str:
         "Eres un planificador de viajes. Tienes dos herramientas: ask_flights (vuelos) y "
         "ask_weather (clima).\n\n"
         f"FECHAS: hoy es {_fecha_legible(today)}. El sábado es {_fecha_legible(saturday)} y el "
-        f"domingo es {_fecha_legible(sunday)}. Usa solo estas fechas, sin calcular otras.\n\n"
-        "MEMORIA DEL USUARIO: si en el contexto aparecen preferencias o datos guardados del "
-        "usuario (aerolínea preferida, horario preferido, etc.), tenlos en cuenta aunque el "
-        "usuario no los repita en este mensaje. Si no hay ninguno, ignora esta sección. "
+        f"domingo es {_fecha_legible(sunday)}. Para solicitudes de fin de semana usa estas fechas; "
+        "si el usuario indica una fecha explícita, usa esa fecha.\n\n"
+        "MEMORIA DEL USUARIO: usa datos guardados solo para preferencias personales, como "
+        "aerolínea u horario. Nunca uses memoria para reemplazar el origen, destino o fechas "
+        "explícitos del mensaje actual. Los datos explícitos del mensaje actual siempre tienen "
+        "prioridad sobre cualquier viaje anterior o memoria. "
+        "La memoria solo aporta preferencias (aerolínea, horario): NUNCA define el origen, "
+        "el destino ni las fechas, que salen siempre del mensaje actual del usuario, aunque "
+        "la memoria mencione otros viajes. "
         "La respuesta de ask_flights incluye una aerolínea explícita por vuelo; usa ese dato "
         "como fuente de verdad y no contradigas el nombre de aerolínea con el código.\n\n"
         "PLAN DE TRABAJO:\n"
-        "- Si el usuario pide 'este fin de semana', la ida es el sábado y el regreso el domingo. "
-        "Si da otras fechas o un trayecto distinto, úsalos. Nunca le pidas la fecha al usuario.\n"
-        "- Llama a ask_flights una vez para la ida y otra para el regreso (con el trayecto invertido). "
-        "En cada llamada incluye ciudad de origen, ciudad de destino y fecha en formato YYYY-MM-DD.\n"
-        "- Llama a ask_weather para la ciudad de destino, para el sábado y el domingo, con fecha "
-        "YYYY-MM-DD.\n"
+        "- El origen y el destino son los que dice el usuario en su mensaje actual (ciudad o código). "
+        "Si pide 'este fin de semana', la ida es el sábado y el regreso el domingo. "
+        "Si da una fecha (por ejemplo '20 de noviembre'), esa es la fecha de la ida (año 2026 si no "
+        "dice otro) y no hay regreso salvo que pida ida y vuelta o dé una segunda fecha. "
+        "Nunca le pidas la fecha al usuario.\n"
+        "- Si no hay regreso, omite la sección REGRESO, cambia la línea 'Fin de semana del ...' "
+        "por 'Fecha: <día> <DD/MM/AAAA>' y consulta el clima solo de esa fecha.\n"
+        "- Llama a ask_flights una vez para cada trayecto solicitado. Para el regreso, invierte el "
+        "trayecto y usa su fecha. En cada llamada incluye ciudad de origen, ciudad de destino y fecha "
+        "en formato YYYY-MM-DD.\n"
+        "- Llama a ask_weather para la ciudad de destino, una vez por cada fecha del viaje "
+        "(sábado y domingo en un fin de semana; solo la fecha de ida si no hay regreso), con fecha "
+        "YYYY-MM-DD. Escribe las condiciones del clima en español.\n"
         "- Haz todas las llamadas antes de responder y no escribas texto antes de llamarlas.\n"
         "- Si una herramienta falla, dilo en esa sección y continúa con el resto.\n\n"
         "RESPUESTA FINAL: en español, texto plano (sin asteriscos, sin tablas, sin etiquetas "
         "<thinking>), con exactamente esta estructura:\n\n"
         "PLAN DE VIAJE: <origen> -> <destino>\n"
         "Fin de semana del <día> <DD/MM/AAAA> al <día> <DD/MM/AAAA> "
-        "(ejemplo: Fin de semana del sábado 10/10/2026 al domingo 11/10/2026)\n\n"
+        "(ejemplo: Fin de semana del sábado 10/10/2026 al domingo 11/10/2026; "
+        "si no hay regreso, usa 'Fecha: <día> <DD/MM/AAAA>')\n\n"
         "IDA - <día y fecha> (<origen> -> <destino>)\n"
-        "  <vuelo> | <aerolínea> | salida <hora> | <precio> USD\n"
-        "  (una línea por vuelo, ordenadas por hora de salida, sin guiones ni la palabra Flight; "
-        "agrega ' (más barato)' al final de la MISMA línea del vuelo de menor precio, solo en esa línea)\n\n"
+        "  <vuelo> | <aerolínea> | salida <hora> | <precio>\n"
+        "  (copia las líneas de vuelo tal cual las devuelve ask_flights, sin su primera línea de ruta "
+        "y fecha: mismo orden, mismo texto, mismo precio y misma marca ' (más barato)'. No las "
+        "reordenes ni agregues texto. Si ask_flights devuelve que no hay vuelos o un error, "
+        "escribe ese mensaje en su lugar)\n\n"
         "REGRESO - <día y fecha> (<destino> -> <origen>)\n"
-        "  (mismo formato que la ida, incluida la marca del más barato)\n\n"
+        "  (mismo formato que la ida, incluida la marca del más barato; omite esta sección "
+        "si el usuario no solicitó regreso)\n\n"
         "CLIMA EN <DESTINO>\n"
-        "  <día y fecha>: <condición>, <temperatura> °C\n\n"
+        "  <día y fecha>: <condición>, <temperatura> °C "
+        "(incluye solo las fechas solicitadas)\n\n"
         "RECOMENDACION\n"
-        "  Dos o tres frases. Primera: el vuelo de ida y el de regreso más baratos con el total de "
-        "ambos (suma exacta de los dos precios) y cómo estará el clima. Segunda: si hay preferencias "
+        "  Una o dos frases. Resume los vuelos más baratos (si hay ida y regreso, incluye el total "
+        "exacto de ambos) y cómo estará el clima. Si hay preferencias "
         "guardadas del usuario (aerolínea u horario), recomienda un vuelo que cumpla todas las "
         "preferencias posibles y menciona por qué. Compara la preferencia de aerolínea con el campo "
         "explícito de aerolínea devuelto por la herramienta y la de horario con la hora de salida. "
@@ -165,7 +212,7 @@ def build_system_prompt() -> str:
         "o búsquedas anteriores. Nunca digas que un vuelo no cumple una preferencia si sus datos "
         "explícitos sí la cumplen. "
         "Si ningún vuelo cumple todas, recomienda el que cumpla más y explica con precisión el "
-        "conflicto. Si no hay preferencias guardadas, omite esta segunda frase.\n\n"
+        "conflicto. Si no hay preferencias guardadas, omite la recomendación de preferencias.\n\n"
         "REGLAS: usa únicamente datos devueltos por las herramientas; no inventes vuelos, "
         "horarios, precios ni clima. La marca '(más barato)' se basa solo en el precio; las "
         "preferencias del usuario solo influyen en la RECOMENDACION. "
@@ -342,12 +389,17 @@ def _resolve_actor_id(payload, context) -> str:
 async def invoke(payload, context):
     log.info("Invoking Trip Planner Orchestrator...")
 
+    prompt = _extract_prompt(payload)
+    if _is_standalone_flight_search(prompt):
+        response = await _invoke_remote_agent(FLIGHTS_ARN, prompt)
+        async for event in _stream_text_response(response):
+            yield event
+        return
+
     session_id = getattr(context, "session_id", "default-session")
     actor_id = _resolve_actor_id(payload, context)
     log.info(f"session_id={session_id} actor_id={actor_id}")
     agent = get_or_create_agent(session_id, actor_id)
-
-    prompt = _extract_prompt(payload)
 
     tag_filter = TagFilter()
     async for event in agent.stream_async(prompt):

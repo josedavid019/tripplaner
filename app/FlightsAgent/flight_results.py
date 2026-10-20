@@ -183,3 +183,15 @@ def format_flight_results(
             line += " (más barato)"
         lines.append(line)
     return "\n".join(lines)
+
+
+def flight_search_unavailable_message(origin: str, destination: str, departure_date: str) -> str:
+    """Return a fixed message when flight search is unavailable."""
+    try:
+        display_date = datetime.strptime(departure_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError:
+        display_date = departure_date
+    return (
+        f"No se pudo consultar vuelos para {origin} a {destination} el {display_date} "
+        "en este momento. Intenta de nuevo en unos minutos."
+    )
