@@ -1,3 +1,4 @@
+from datetime import date
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -36,54 +37,17 @@ class RemoteAgentLifecycleTests(unittest.IsolatedAsyncioTestCase):
         async_client_class.return_value.__aexit__.assert_awaited_once()
 
 
-class StandaloneFlightRoutingTests(unittest.IsolatedAsyncioTestCase):
-    def test_only_direct_flight_queries_bypass_trip_planning(self):
-        self.assertTrue(
-            orchestrator._is_standalone_flight_search(
-                "Vuelos de BAQ a MAD el 20 de noviembre"
-            )
-        )
-        self.assertTrue(
-            orchestrator._is_standalone_flight_search(
-                "Vuelos de Barranquilla a Madrid el 20 de noviembre"
-            )
-        )
-        self.assertFalse(
-            orchestrator._is_standalone_flight_search(
-                "Plan de viaje de BAQ a MAD este fin de semana"
-            )
-        )
-        self.assertFalse(
-            orchestrator._is_standalone_flight_search(
-                "¿Qué clima hace en Madrid?"
-            )
-        )
-        self.assertFalse(orchestrator._is_standalone_flight_search(["message history"]))
-
-    async def test_direct_flight_response_is_streamed_without_rewriting(self):
-        expected = "20/11/2026 | BAQ → MAD\nFlight ABC | Airline | salida 15:40 | $100"
-
-        events = [
-            event async for event in orchestrator._stream_text_response(expected)
-        ]
-
-        self.assertEqual(
-            events[0]["event"]["contentBlockDelta"]["delta"]["text"],
-            expected,
-        )
-        self.assertEqual(
-            events[1],
-            {"event": {"contentBlockStop": {"contentBlockIndex": 0}}},
-        )
-
-    @patch("app.OrchestratorAgent.main.get_or_create_agent")
+class FlightWeatherRoutingTests(unittest.IsolatedAsyncioTestCase):
     @patch("app.OrchestratorAgent.main._invoke_remote_agent", new_callable=AsyncMock)
-    async def test_standalone_query_bypasses_orchestrator_model_and_memory(
-        self,
-        invoke_remote_agent,
-        get_or_create_agent,
+    @patch("app.OrchestratorAgent.main.get_or_create_agent")
+    async def test_direct_flight_query_calls_flights_and_weather_deterministically(
+        self, get_or_create_agent, invoke_remote_agent
     ):
-        invoke_remote_agent.return_value = "20/11/2026 | BAQ → MAD\nFlight ABC"
+        invoke_remote_agent.side_effect = [
+            "20/11/2026 | BAQ -> MAD\n"
+            "LA4157 / LA4907 | LATAM Airlines | salida 20:50 | $720 (más barato)",
+            "Soleado, 29 °C",
+        ]
 
         events = [
             event
@@ -93,14 +57,51 @@ class StandaloneFlightRoutingTests(unittest.IsolatedAsyncioTestCase):
             )
         ]
 
-        invoke_remote_agent.assert_awaited_once_with(
-            orchestrator.FLIGHTS_ARN,
-            "Vuelos de BAQ a MAD el 20 de noviembre",
-        )
         get_or_create_agent.assert_not_called()
+        self.assertEqual(invoke_remote_agent.await_count, 2)
+        self.assertEqual(
+            invoke_remote_agent.await_args_list[0].args,
+            (
+                orchestrator.FLIGHTS_ARN,
+                "Busca vuelos de BAQ a MAD para el 2026-11-20.",
+            ),
+        )
+        self.assertEqual(
+            invoke_remote_agent.await_args_list[1].args,
+            (
+                orchestrator.WEATHER_ARN,
+                "Consulta el pronóstico del clima para MAD el 2026-11-20.",
+            ),
+        )
         self.assertEqual(
             events[0]["event"]["contentBlockDelta"]["delta"]["text"],
-            "20/11/2026 | BAQ → MAD\nFlight ABC",
+            "PLAN DE VIAJE: BAQ -> MAD\n"
+            "Fecha: viernes 20/11/2026\n\n"
+            "IDA - viernes 20/11/2026 (BAQ -> MAD)\n"
+            "LA4157 / LA4907 | LATAM Airlines | salida 20:50 | $720 (más barato)\n\n"
+            "CLIMA EN MAD\n"
+            "  viernes 20/11/2026: Soleado, 29 °C\n\n"
+            "RECOMENDACIÓN\n"
+            "Opción más económica de ida: LA4157 / LA4907 | LATAM Airlines | "
+            "salida 20:50 | $720.\n"
+            "Clima en MAD: viernes 20/11/2026: Soleado, 29 °C",
+        )
+
+    def test_direct_flight_parser_resolves_supported_date_formats(self):
+        self.assertEqual(
+            orchestrator.parse_direct_flight_query(
+                "Vuelos de BAQ a MAD el 25 de noviembre"
+            ),
+            ("BAQ", "MAD", date(2026, 11, 25)),
+        )
+        self.assertEqual(
+            orchestrator.parse_direct_flight_query(
+                "Vuelos de Barranquilla a Madrid el 20/11/2026"
+            ),
+            ("Barranquilla", "Madrid", date(2026, 11, 20)),
+        )
+        self.assertIsNone(
+            orchestrator.parse_direct_flight_query("¿Qué clima hace en Madrid?")
         )
 
 
@@ -113,11 +114,133 @@ class OrchestratorPromptTests(unittest.TestCase):
         self.assertIn("no hay regreso", prompt)
         self.assertIn("consulta el clima solo de esa fecha", prompt)
         self.assertIn("Escribe las condiciones del clima en español", prompt)
+        self.assertIn(
+            "también aplica a solicitudes directas de vuelos",
+            prompt,
+        )
+        self.assertIn("No conviertas nombres de ciudades a códigos IATA", prompt)
+        self.assertIn("pásala por su nombre a ask_flights", prompt)
         self.assertIn("mismo orden, mismo texto, mismo precio", prompt)
         self.assertNotIn("<precio> USD", prompt)
 
+    def test_weekday_labels_are_corrected_from_the_calendar_date(self):
+        self.assertEqual(
+            orchestrator.correct_weekdays(
+                "sábado 20/11/2026\ndomingo 25/11/2026\nsábado 24/10/2026"
+            ),
+            "viernes 20/11/2026\nmiércoles 25/11/2026\nsábado 24/10/2026",
+        )
+
+    def test_invalid_calendar_dates_are_left_unchanged(self):
+        self.assertEqual(
+            orchestrator.correct_weekdays("sábado 31/02/2026"),
+            "sábado 31/02/2026",
+        )
+
+    def test_weather_result_removes_thinking_tags_and_keeps_forecast_facts(self):
+        self.assertEqual(
+            orchestrator.normalize_weather_result(
+                "<thinking>I should explain the tool call.</thinking> "
+                "El pronóstico para Madrid es parcialmente nublado con una "
+                "temperatura de 24°C."
+            ),
+            "Parcialmente nublado, 24 °C",
+        )
+        self.assertEqual(
+            orchestrator.normalize_weather_result(
+                "<thinking>I have the forecast.</thinking> "
+                "Madrid will have isolated thunderstorms, 22 °C."
+            ),
+            "Tormentas aisladas, 22 °C",
+        )
+
+    def test_weather_result_does_not_echo_unrecognized_model_prose(self):
+        self.assertEqual(
+            orchestrator.normalize_weather_result(
+                "<thinking>Internal reasoning.</thinking> I cannot provide that."
+            ),
+            "Pronóstico no disponible.",
+        )
+
+    def test_normalizer_restores_flight_order_and_calculates_round_trip_total(self):
+        response = (
+            "PLAN DE VIAJE: Barranquilla -> Madrid\n"
+            "IDA - sábado 24/10/2026 (Barranquilla -> Madrid)\n"
+            "AV9525 / IB154 | Avianca, Iberia | salida 18:20 | $816 (más barato)\n"
+            "REGRESO - domingo 25/10/2026 (Madrid -> Barranquilla)\n"
+            "AV183 / AV9532 | Avianca | salida 10:10 | $1,035 (más barato)\n"
+            "CLIMA EN MADRID\n"
+            "24/10/2026: Lluvioso, 14 °C\n"
+            "RECOMENDACION\n"
+            "El vuelo más barato es AV9525. El totalde tu viaje es $1,831."
+        )
+        ida = (
+            "24/10/2026 | BAQ -> MAD\n"
+            "AV8419 / IB156 | Avianca, Iberia | salida 06:25 | $823\n"
+            "AV9525 / IB154 | Avianca, Iberia | salida 18:20 | $816 (más barato)"
+        )
+        regreso = (
+            "25/10/2026 | MAD -> BAQ\n"
+            "AV183 / AV9532 | Avianca | salida 10:10 | $1,035 (más barato)"
+        )
+
+        normalized = orchestrator.normalize_trip_response(response, [ida, regreso])
+
+        self.assertIn(
+            "AV8419 / IB156 | Avianca, Iberia | salida 06:25 | $823\n"
+            "AV9525 / IB154 | Avianca, Iberia | salida 18:20 | $816 (más barato)",
+            normalized,
+        )
+        self.assertIn("Total de ida y vuelta: $1,851.", normalized)
+        self.assertIn("sábado 24/10/2026: Lluvioso, 14 °C", normalized)
+        self.assertIn(
+            "Clima en MADRID: sábado 24/10/2026: Lluvioso, 14 °C",
+            normalized,
+        )
+        self.assertNotIn("$1,831", normalized)
+        self.assertNotIn("totalde", normalized)
+
+    def test_normalizer_removes_false_return_message_for_one_way_trip(self):
+        response = (
+            "IDA - viernes 20/11/2026 (BAQ -> MAD)\n"
+            "Otra opción: $751\n"
+            "RECOMENDACION\n"
+            "No hay regreso programado para este viaje."
+        )
+        flights = (
+            "20/11/2026 | BAQ -> MAD\n"
+            "LA4157 / LA4907 | LATAM Airlines | salida 20:50 | $720 (más barato)"
+        )
+
+        normalized = orchestrator.normalize_trip_response(response, [flights])
+
+        self.assertIn("$720 (más barato)", normalized)
+        self.assertIn(
+            "Opción más económica de ida: LA4157 / LA4907 | LATAM Airlines | "
+            "salida 20:50 | $720.",
+            normalized,
+        )
+        self.assertNotIn("$751", normalized)
+        self.assertNotIn("No hay regreso programado", normalized)
+
 
 class AskFlightsFallbackTests(unittest.IsolatedAsyncioTestCase):
+    @patch("app.OrchestratorAgent.main._invoke_remote_agent", new_callable=AsyncMock)
+    async def test_successful_flight_results_are_captured_for_final_response(self, invoke_remote):
+        invoke_remote.return_value = (
+            "20/11/2026 | BAQ -> MAD\n"
+            "LA4157 | LATAM Airlines | salida 20:50 | $720 (más barato)"
+        )
+        captured_results = []
+        token = orchestrator.flight_search_results.set(captured_results)
+        try:
+            response = await orchestrator.ask_flights("BAQ a MAD el 20 de noviembre")
+        finally:
+            orchestrator.flight_search_results.reset(token)
+
+        self.assertEqual(captured_results, [response])
+        self.assertIn("$720 (más barato)", response)
+
     @patch("app.OrchestratorAgent.main._invoke_remote_agent", new_callable=AsyncMock)
     async def test_ask_flights_returns_fixed_message_when_flights_fails(self, invoke_remote):
         invoke_remote.side_effect = RuntimeError("timeout")
@@ -128,6 +251,15 @@ class AskFlightsFallbackTests(unittest.IsolatedAsyncioTestCase):
             response,
             "No se pudo consultar vuelos en este momento. Intenta de nuevo en unos minutos.",
         )
+
+
+class AskWeatherLoggingTests(unittest.IsolatedAsyncioTestCase):
+    @patch("app.OrchestratorAgent.main._invoke_remote_agent", new_callable=AsyncMock)
+    async def test_ask_weather_logs_and_reraises_remote_failures(self, invoke_remote):
+        invoke_remote.side_effect = RuntimeError("weather runtime unavailable")
+
+        with self.assertRaisesRegex(RuntimeError, "weather runtime unavailable"):
+            await orchestrator.ask_weather("Madrid 2026-10-24")
 
 
 if __name__ == "__main__":

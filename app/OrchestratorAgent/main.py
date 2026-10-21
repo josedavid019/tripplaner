@@ -1,8 +1,10 @@
 import os
 import re
 import unicodedata
+from contextvars import ContextVar
 from collections import OrderedDict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 from urllib.parse import quote
 
@@ -26,6 +28,10 @@ from a2a.client import ClientConfig, ClientFactory
 
 app = BedrockAgentCoreApp()
 log = app.logger
+flight_search_results: ContextVar[list[str] | None] = ContextVar(
+    "flight_search_results",
+    default=None,
+)
 
 REGION = os.environ.get("AWS_REGION", "us-east-2")
 MODEL_ID = "us.amazon.nova-lite-v1:0"
@@ -98,17 +104,365 @@ async def _invoke_remote_agent(arn: str, request: str) -> str:
         return str(await remote.invoke_async(request))
 
 
-def _is_standalone_flight_search(prompt: Any) -> bool:
+@tool
+async def ask_flights(request: str) -> str:
+    """Delega en el Flights Agent la búsqueda de vuelos."""
+    try:
+        response = await _invoke_remote_agent(FLIGHTS_ARN, request)
+    except Exception as exc:
+        log.error(f"ask_flights falló: {exc!r}")
+        response = "No se pudo consultar vuelos en este momento. Intenta de nuevo en unos minutos."
+    results = flight_search_results.get()
+    if results is not None:
+        results.append(response)
+    return response
+
+
+@tool
+async def ask_weather(request: str) -> str:
+    """Delega en el Weather Agent la consulta de clima."""
+    try:
+        return await _invoke_remote_agent(WEATHER_ARN, request)
+    except Exception:
+        log.exception("ask_weather falló para la solicitud %r", request)
+        raise
+
+
+DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
+         "septiembre", "octubre", "noviembre", "diciembre"]
+WEEKDAY_DATE_PATTERN = re.compile(
+    r"\b(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo)"
+    r"(\s+)(\d{2}/\d{2}/\d{4})",
+    re.IGNORECASE,
+)
+BARE_DATE_PATTERN = re.compile(r"^\s*(\d{2}/\d{2}/\d{4})(\s*:)")
+DIRECT_FLIGHT_QUERY_PATTERN = re.compile(
+    r"^\s*vuelos?\s+de\s+(?P<origin>.+?)\s+a\s+(?P<destination>.+?)"
+    r"\s+(?:el|para el)\s+(?P<date>.+?)\s*[?.!]*\s*$",
+    re.IGNORECASE,
+)
+MONTH_NUMBERS = {
+    name: number
+    for number, name in enumerate(
+        (
+            "enero", "febrero", "marzo", "abril", "mayo", "junio",
+            "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+        ),
+        start=1,
+    )
+}
+
+
+def _remove_accents(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value.casefold())
+    return "".join(char for char in normalized if not unicodedata.combining(char))
+
+
+def parse_direct_flight_query(prompt: Any) -> tuple[str, str, date] | None:
     if not isinstance(prompt, str):
-        return False
+        return None
+    match = DIRECT_FLIGHT_QUERY_PATTERN.fullmatch(prompt)
+    if match is None:
+        return None
 
-    normalized = unicodedata.normalize("NFKD", prompt.casefold())
-    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
-    if not re.search(r"\bvuelos?\s+de\s+.+?\s+a\s+.+", normalized):
-        return False
+    date_text = match.group("date").strip()
+    try:
+        travel_date = datetime.strptime(date_text, "%d/%m/%Y").date()
+    except ValueError:
+        normalized_date = _remove_accents(date_text)
+        date_match = re.fullmatch(
+            r"(?P<day>\d{1,2})\s+de\s+(?P<month>[a-z]+)"
+            r"(?:\s+de\s+(?P<year>\d{4}))?",
+            normalized_date,
+        )
+        if date_match is None:
+            return None
+        month = MONTH_NUMBERS.get(date_match.group("month"))
+        if month is None:
+            return None
+        year = int(date_match.group("year") or datetime.now(
+            timezone(timedelta(hours=-5))
+        ).year)
+        try:
+            travel_date = date(year, month, int(date_match.group("day")))
+        except ValueError:
+            return None
+    return (
+        match.group("origin").strip(),
+        match.group("destination").strip(),
+        travel_date,
+    )
 
-    planning_terms = ("plan de viaje", "itinerario", "fin de semana", "clima", "tiempo")
-    return not any(term in normalized for term in planning_terms)
+
+def correct_weekdays(text: str) -> str:
+    """Corrects Spanish weekday labels using their adjacent DD/MM/YYYY date."""
+
+    def replace(match: re.Match[str]) -> str:
+        try:
+            actual_weekday = datetime.strptime(match.group(3), "%d/%m/%Y").date().weekday()
+        except ValueError:
+            return match.group(0)
+        weekday = DIAS[actual_weekday]
+        if match.group(1)[0].isupper():
+            weekday = weekday.capitalize()
+        return f"{weekday}{match.group(2)}{match.group(3)}"
+
+    return WEEKDAY_DATE_PATTERN.sub(replace, text)
+
+
+FLIGHT_PRICE_PATTERN = re.compile(
+    r"^\s*(?P<currency>[^\d\s]+)?\s*(?P<amount>\d[\d,]*(?:\.\d+)?)"
+    r"(?:\s+(?P<suffix>[A-Z]{3}))?\s*$"
+)
+
+
+def _flight_rows(search_result: str) -> list[str]:
+    lines = [line.strip() for line in search_result.splitlines() if line.strip()]
+    if lines and re.match(r"^\d{2}/\d{2}/\d{4}\s*\|", lines[0]):
+        lines = lines[1:]
+    return lines
+
+
+def _flight_price(row: str) -> tuple[Decimal, str, str] | None:
+    price = row.rsplit("|", 1)[-1].strip()
+    price = re.sub(r"\s*\(más barato\)\s*$", "", price)
+    match = FLIGHT_PRICE_PATTERN.fullmatch(price)
+    if match is None:
+        return None
+    amount = Decimal(match.group("amount").replace(",", ""))
+    currency = match.group("currency") or match.group("suffix") or ""
+    return amount, currency, price
+
+
+def _best_flight_row(rows: list[str]) -> str | None:
+    priced_rows = [(parsed[0], row) for row in rows if (parsed := _flight_price(row))]
+    if not priced_rows:
+        return None
+    return min(priced_rows, key=lambda item: item[0])[1]
+
+
+def _replace_section(lines: list[str], name: str, content: list[str]) -> bool:
+    section_pattern = re.compile(rf"^\s*{name}\b", re.IGNORECASE)
+    section_names = ("IDA", "REGRESO", "CLIMA EN", "RECOMENDACI[ÓO]N")
+    next_section_pattern = re.compile(
+        r"^\s*(?:" + "|".join(section_names) + r")\b",
+        re.IGNORECASE,
+    )
+    start = next((i for i, line in enumerate(lines) if section_pattern.match(line)), None)
+    if start is None:
+        return False
+    end = next(
+        (
+            i
+            for i in range(start + 1, len(lines))
+            if next_section_pattern.match(lines[i])
+        ),
+        len(lines),
+    )
+    lines[start + 1 : end] = content + [""]
+    return True
+
+
+def _format_total(first: str, second: str) -> str | None:
+    first_price = _flight_price(first)
+    second_price = _flight_price(second)
+    if first_price is None or second_price is None or first_price[1] != second_price[1]:
+        return None
+    total = first_price[0] + second_price[0]
+    if total == total.to_integral_value():
+        amount = f"{total:,.0f}"
+    else:
+        amount = f"{total:,.2f}"
+    return f"{first_price[1]}{amount}"
+
+
+def _normalize_climate_section(lines: list[str]) -> str | None:
+    climate_index = next(
+        (
+            i for i, line in enumerate(lines)
+            if re.match(r"^\s*CLIMA EN\b", line, re.IGNORECASE)
+        ),
+        None,
+    )
+    if climate_index is None:
+        return None
+
+    recommendation_index = next(
+        (
+            i for i, line in enumerate(lines[climate_index + 1 :], climate_index + 1)
+            if re.match(r"^\s*RECOMENDACI[ÓO]N\b", line, re.IGNORECASE)
+        ),
+        len(lines),
+    )
+    climate_lines = lines[climate_index + 1 : recommendation_index]
+    normalized_lines = []
+    for line in climate_lines:
+        match = BARE_DATE_PATTERN.match(line)
+        if match is None:
+            normalized_lines.append(line)
+            continue
+        try:
+            day = datetime.strptime(match.group(1), "%d/%m/%Y").date()
+        except ValueError:
+            normalized_lines.append(line)
+            continue
+        normalized_lines.append(
+            f"{DIAS[day.weekday()]} {match.group(1)}{line[match.end(1):]}"
+        )
+
+    lines[climate_index + 1 : recommendation_index] = normalized_lines
+    climate_facts = [line.strip() for line in normalized_lines if line.strip()]
+    if not climate_facts:
+        return None
+    city = re.sub(r"^\s*CLIMA EN\s+", "", lines[climate_index], flags=re.IGNORECASE).strip()
+    summary = "; ".join(climate_facts)
+    return f"Clima en {city}: {summary}" if city else f"Clima: {summary}"
+
+
+WEATHER_CONDITIONS = (
+    (("parcialmente nublado", "partly cloudy"), "Parcialmente nublado"),
+    (("nublado", "nublada", "cloudy"), "Nublado"),
+    (("soleado", "soleada", "sunny"), "Soleado"),
+    (("lluvia ligera", "light rain"), "Lluvia ligera"),
+    (("lluvioso", "lluviosa", "rainy"), "Lluvioso"),
+    (("tormentas aisladas", "isolated thunderstorms"), "Tormentas aisladas"),
+    (("ventoso", "ventosa", "windy"), "Ventoso"),
+)
+TEMPERATURE_PATTERN = re.compile(r"(?P<temperature>-?\d{1,2}(?:[.,]\d+)?)\s*°\s*C", re.IGNORECASE)
+
+
+def normalize_weather_result(response: str) -> str:
+    """Remove model reasoning and retain only a recognized simulated condition and temperature."""
+    tag_filter = TagFilter()
+    clean_response = tag_filter.feed(response, final=True)
+    normalized = _remove_accents(clean_response)
+
+    condition = next(
+        (
+            display
+            for phrases, display in WEATHER_CONDITIONS
+            if any(re.search(rf"\b{re.escape(phrase)}\b", normalized) for phrase in phrases)
+        ),
+        None,
+    )
+    if condition is None:
+        log.warning("No se reconoció la condición del pronóstico: %r", clean_response)
+        return "Pronóstico no disponible."
+
+    temperature = TEMPERATURE_PATTERN.search(clean_response)
+    if temperature is None:
+        log.warning("No se reconoció la temperatura del pronóstico: %r", clean_response)
+        return "Pronóstico no disponible."
+    return f"{condition}, {temperature.group('temperature').replace(',', '.')} °C"
+
+
+def normalize_trip_response(response: str, search_results: list[str]) -> str:
+    """Restore tool-authoritative flight rows and calculate the recommendation from them."""
+    if not search_results:
+        return correct_weekdays(response).strip()
+
+    lines = correct_weekdays(response).splitlines()
+    climate_summary = _normalize_climate_section(lines)
+    flight_rows = [_flight_rows(result) for result in search_results]
+    ida_present = _replace_section(lines, "IDA", flight_rows[0])
+
+    if len(flight_rows) > 1:
+        if not _replace_section(lines, "REGRESO", flight_rows[1]):
+            climate_index = next(
+                (
+                    i for i, line in enumerate(lines)
+                    if re.match(r"^\s*CLIMA EN\b", line, re.IGNORECASE)
+                ),
+                len(lines),
+            )
+            lines[climate_index:climate_index] = ["REGRESO", *flight_rows[1], ""]
+    else:
+        lines = [
+            line for line in lines
+            if not re.match(r"^\s*REGRESO\b", line, re.IGNORECASE)
+            and not re.match(r"^\s*No hay regreso programado\b", line, re.IGNORECASE)
+        ]
+
+    recommendations = ["RECOMENDACIÓN"]
+    ida_best = _best_flight_row(flight_rows[0])
+    if ida_best is None:
+        recommendations.append("No se pudo determinar la opción más económica de ida.")
+    else:
+        recommendations.append(
+            f"Opción más económica de ida: {ida_best.removesuffix(' (más barato)')}."
+        )
+    if len(flight_rows) > 1:
+        regreso_best = _best_flight_row(flight_rows[1])
+        if regreso_best is None:
+            recommendations.append("No se pudo determinar la opción más económica de regreso.")
+        else:
+            recommendations.append(
+                f"Opción más económica de regreso: "
+                f"{regreso_best.removesuffix(' (más barato)')}."
+            )
+            if ida_best is not None:
+                total = _format_total(ida_best, regreso_best)
+                if total is not None:
+                    recommendations.append(f"Total de ida y vuelta: {total}.")
+    if climate_summary:
+        recommendations.append(climate_summary)
+
+    recommendation_index = next(
+        (
+            i for i, line in enumerate(lines)
+            if re.match(r"^\s*RECOMENDACI[ÓO]N\b", line, re.IGNORECASE)
+        ),
+        None,
+    )
+    if recommendation_index is None:
+        lines.extend(["", *recommendations])
+    else:
+        lines[recommendation_index:] = recommendations
+    return "\n".join(lines).strip()
+
+
+async def _direct_flight_response(
+    origin: str,
+    destination: str,
+    travel_date: date,
+) -> str:
+    flight_request = (
+        f"Busca vuelos de {origin} a {destination} para el {travel_date.isoformat()}."
+    )
+    flight_result = await ask_flights(flight_request)
+
+    try:
+        weather_result = await _invoke_remote_agent(
+            WEATHER_ARN,
+            f"Consulta el pronóstico del clima para {destination} "
+            f"el {travel_date.isoformat()}.",
+        )
+    except Exception:
+        log.exception(
+            "No se pudo obtener el clima en %s para %s",
+            destination,
+            travel_date.isoformat(),
+        )
+        weather_result = "No se pudo consultar el clima en este momento."
+
+    display_date = travel_date.strftime("%d/%m/%Y")
+    weekday = DIAS[travel_date.weekday()]
+    weather_text = normalize_weather_result(weather_result)
+    response = "\n".join(
+        [
+            f"PLAN DE VIAJE: {origin} -> {destination}",
+            f"Fecha: {weekday} {display_date}",
+            "",
+            f"IDA - {weekday} {display_date} ({origin} -> {destination})",
+            "",
+            f"CLIMA EN {destination}",
+            f"  {weekday} {display_date}: {weather_text}",
+            "",
+            "RECOMENDACIÓN",
+        ]
+    )
+    return normalize_trip_response(response, [flight_result])
 
 
 async def _stream_text_response(text: str):
@@ -121,27 +475,6 @@ async def _stream_text_response(text: str):
         }
     }
     yield {"event": {"contentBlockStop": {"contentBlockIndex": 0}}}
-
-
-@tool
-async def ask_flights(request: str) -> str:
-    """Delega en el Flights Agent la búsqueda de vuelos."""
-    try:
-        return await _invoke_remote_agent(FLIGHTS_ARN, request)
-    except Exception as exc:
-        log.error(f"ask_flights falló: {exc!r}")
-        return "No se pudo consultar vuelos en este momento. Intenta de nuevo en unos minutos."
-
-
-@tool
-async def ask_weather(request: str) -> str:
-    """Delega en el Weather Agent la consulta de clima."""
-    return await _invoke_remote_agent(WEATHER_ARN, request)
-
-
-DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
-MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
-         "septiembre", "octubre", "noviembre", "diciembre"]
 
 
 def _fecha_legible(d) -> str:
@@ -170,18 +503,25 @@ def build_system_prompt() -> str:
         "como fuente de verdad y no contradigas el nombre de aerolínea con el código.\n\n"
         "PLAN DE TRABAJO:\n"
         "- El origen y el destino son los que dice el usuario en su mensaje actual (ciudad o código). "
+        "No conviertas nombres de ciudades a códigos IATA ni inventes códigos: cuando el usuario "
+        "dé una ciudad, pásala por su nombre a ask_flights para que Flights Agent la resuelva con "
+        "sk_resolve_iata. Si el usuario da un código, conserva ese código exactamente.\n"
         "Si pide 'este fin de semana', la ida es el sábado y el regreso el domingo. "
         "Si da una fecha (por ejemplo '20 de noviembre'), esa es la fecha de la ida (año 2026 si no "
         "dice otro) y no hay regreso salvo que pida ida y vuelta o dé una segunda fecha. "
         "Nunca le pidas la fecha al usuario.\n"
         "- Si no hay regreso, omite la sección REGRESO, cambia la línea 'Fin de semana del ...' "
         "por 'Fecha: <día> <DD/MM/AAAA>' y consulta el clima solo de esa fecha.\n"
+        "- El día de la semana debe corresponder al calendario de cada fecha. No lo deduzcas "
+        "del contexto del viaje; verifica siempre el día a partir de DD/MM/AAAA.\n"
         "- Llama a ask_flights una vez para cada trayecto solicitado. Para el regreso, invierte el "
         "trayecto y usa su fecha. En cada llamada incluye ciudad de origen, ciudad de destino y fecha "
         "en formato YYYY-MM-DD.\n"
         "- Llama a ask_weather para la ciudad de destino, una vez por cada fecha del viaje "
         "(sábado y domingo en un fin de semana; solo la fecha de ida si no hay regreso), con fecha "
         "YYYY-MM-DD. Escribe las condiciones del clima en español.\n"
+        "- Esta regla también aplica a solicitudes directas de vuelos aunque el usuario no mencione "
+        "un plan de viaje ni el clima: consulta siempre ask_weather para cada fecha solicitada.\n"
         "- Haz todas las llamadas antes de responder y no escribas texto antes de llamarlas.\n"
         "- Si una herramienta falla, dilo en esa sección y continúa con el resto.\n\n"
         "RESPUESTA FINAL: en español, texto plano (sin asteriscos, sin tablas, sin etiquetas "
@@ -390,8 +730,14 @@ async def invoke(payload, context):
     log.info("Invoking Trip Planner Orchestrator...")
 
     prompt = _extract_prompt(payload)
-    if _is_standalone_flight_search(prompt):
-        response = await _invoke_remote_agent(FLIGHTS_ARN, prompt)
+    direct_query = parse_direct_flight_query(prompt)
+    if direct_query is not None:
+        origin, destination, travel_date = direct_query
+        response = await _direct_flight_response(
+            origin,
+            destination,
+            travel_date,
+        )
         async for event in _stream_text_response(response):
             yield event
         return
@@ -401,27 +747,34 @@ async def invoke(payload, context):
     log.info(f"session_id={session_id} actor_id={actor_id}")
     agent = get_or_create_agent(session_id, actor_id)
 
-    tag_filter = TagFilter()
-    async for event in agent.stream_async(prompt):
-        if not isinstance(event, dict) or "event" not in event:
-            continue
-        ev = event["event"]
-        cbs = ev.get("contentBlockStart")
-        if cbs is not None and not cbs.get("start"):
-            continue
-
-        delta = ev.get("contentBlockDelta")
-        if delta is not None and "text" in delta.get("delta", {}):
-            clean = tag_filter.feed(delta["delta"]["text"])
-            if not clean:
+    search_results: list[str] = []
+    token = flight_search_results.set(search_results)
+    try:
+        tag_filter = TagFilter()
+        response_parts = []
+        async for event in agent.stream_async(prompt):
+            if not isinstance(event, dict) or "event" not in event:
                 continue
-            delta["delta"]["text"] = clean
-        elif "contentBlockStop" in ev:
-            rest = tag_filter.feed("", final=True)
-            if rest:
-                idx = ev["contentBlockStop"].get("contentBlockIndex", 0)
-                yield {"event": {"contentBlockDelta": {"delta": {"text": rest}, "contentBlockIndex": idx}}}
-            tag_filter = TagFilter()
+            ev = event["event"]
+            cbs = ev.get("contentBlockStart")
+            if cbs is not None and not cbs.get("start"):
+                continue
+
+            delta = ev.get("contentBlockDelta")
+            if delta is not None and "text" in delta.get("delta", {}):
+                clean = tag_filter.feed(delta["delta"]["text"])
+                if clean:
+                    response_parts.append(clean)
+            elif "contentBlockStop" in ev:
+                rest = tag_filter.feed("", final=True)
+                if rest:
+                    response_parts.append(rest)
+                tag_filter = TagFilter()
+        response_parts.append(tag_filter.feed("", final=True))
+        response = normalize_trip_response("".join(response_parts), search_results)
+    finally:
+        flight_search_results.reset(token)
+    async for event in _stream_text_response(response):
         yield event
 
 

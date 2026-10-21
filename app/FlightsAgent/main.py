@@ -1,6 +1,7 @@
 # app/FlightsAgent/main.py
 import logging
 import os
+import time
 from datetime import date, timedelta
 from uuid import uuid4
 from urllib.parse import quote
@@ -14,6 +15,7 @@ from strands.tools.mcp import MCPClient
 from flight_results import flight_search_unavailable_message, format_flight_results
 from flight_response import FlightResponseAgent
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 TRAVEL_MCP_URL = os.environ.get("TRAVEL_MCP_URL", "https://mcp.skiplagged.com/mcp")
 MCP_READ_TIMEOUT = timedelta(seconds=25)
@@ -42,8 +44,11 @@ def build_system_prompt() -> str:
     return (
         f"Hoy es {date.today().isoformat()}. "
         "Eres un agente de vuelos. Para buscar usa sk_flights_search con: "
-        "origin y destination como códigos IATA (si el usuario da una ciudad y no sabes "
-        "el código, usa sk_resolve_iata primero), departureDate en formato YYYY-MM-DD "
+        "origin y destination como códigos IATA. Si el usuario indica una ciudad por nombre, "
+        "llama siempre a sk_resolve_iata para obtener su código antes de buscar; nunca inventes "
+        "ni deduzcas un código IATA a partir del nombre de una ciudad. Si el usuario ya "
+        "proporciona un código IATA, consérvalo exactamente y no lo sustituyas por otro. "
+        "departureDate en formato YYYY-MM-DD "
         "(si el usuario no da el año, usa la próxima fecha futura), sort='price', limit=5, "
         "includeHiddenCity=false e includeVirtualInterlining=false. "
         "La herramienta devuelve el resultado final ya ordenado, con la fecha y el vuelo más "
@@ -69,6 +74,7 @@ def create_agent(context_id: str) -> Agent:
         includeVirtualInterlining: bool = False,
     ) -> str:
         """Busca vuelos y devuelve resultados ordenados con el precio mínimo marcado."""
+        started = time.perf_counter()
         try:
             result = travel_mcp.call_tool_sync(
                 uuid4().hex,
@@ -101,8 +107,23 @@ def create_agent(context_id: str) -> Agent:
                 departureDate,
             )
         except Exception:
-            logger.exception("sk_flights_search falló")
+            # Timeout, servidor caído o formato inesperado: mensaje fijo, sin inventar vuelos.
+            logger.exception(
+                "sk_flights_search falló tras %.0f ms (%s -> %s, %s)",
+                (time.perf_counter() - started) * 1000,
+                origin,
+                destination,
+                departureDate,
+            )
             response = flight_search_unavailable_message(origin, destination, departureDate)
+        else:
+            logger.info(
+                "sk_flights_search ok en %.0f ms (%s -> %s, %s)",
+                (time.perf_counter() - started) * 1000,
+                origin,
+                destination,
+                departureDate,
+            )
         search_state["response"] = response
         return response
 
